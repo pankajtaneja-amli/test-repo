@@ -440,28 +440,8 @@ def create_spark_session(config):
     except Exception as e:
         raise Exception("Error in Spark Session Creation.")
 
-def flatten_struct_columns(df, prefix=""):
-    """
-    Recursively flatten struct columns in a PySpark DataFrame.
-    :param df: PySpark DataFrame
-    :param prefix: prefix for nested column names
-    :return: list of flattened column expressions
-    """
-    flat_cols = []
-    for field in df.schema.fields:
-        col_name = f"{prefix}{field.name}" if prefix else field.name
-        if hasattr(field.dataType, 'fields'):
-            # It's a struct, recurse through nested fields
-            for nested_field in field.dataType.fields:
-                nested_col_name = f"{col_name}_{nested_field.name}"
-                if hasattr(nested_field.dataType, 'fields'):
-                    # Further nested struct - handle recursively
-                    flat_cols.append(col(f"`{field.name}`.`{nested_field.name}`").alias(nested_col_name))
-                else:
-                    flat_cols.append(col(f"`{field.name}`.`{nested_field.name}`").alias(nested_col_name))
-        else:
-            flat_cols.append(col(f"`{field.name}`").alias(col_name))
-    return flat_cols
+# DynamoDB type indicators for extracting values from the type wrapper format
+DYNAMODB_TYPE_INDICATORS = ['S', 'N', 'B', 'BOOL', 'NULL', 'M', 'L', 'SS', 'NS', 'BS']
 
 
 def process_nested_json_spark(spark, base_df):
@@ -612,7 +592,7 @@ def read_file(spark, config, file, file_list_to_process):
                         if hasattr(field.dataType, 'fields'):
                             # Check for common DynamoDB types
                             for subfield in field.dataType.fields:
-                                if subfield.name in ['S', 'N', 'B', 'BOOL', 'NULL', 'M', 'L', 'SS', 'NS', 'BS']:
+                                if subfield.name in DYNAMODB_TYPE_INDICATORS:
                                     select_cols.append(col(f'NewImage.{field.name}.{subfield.name}').alias(field.name))
                                     break
                             else:
