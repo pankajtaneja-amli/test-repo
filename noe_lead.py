@@ -5,7 +5,8 @@ from pyspark.sql import SparkSession
 from pyspark import SparkConf
 from pyspark.sql import functions as F
 from pyspark.sql.functions import col, concat_ws, when, collect_list, lit, to_timestamp
-from pyspark.sql.functions import year, month, date_format
+from pyspark.sql.functions import year, month, date_format, explode_outer
+from pyspark.sql.types import StringType, ArrayType, StructType
 import sys
 import logging
 import datetime
@@ -14,9 +15,6 @@ import time
 sys.path.append('/home/hadoop')
 import boto3
 from boto3.dynamodb.types import TypeDeserializer
-import pandas as pd
-import awswrangler as wr
-import awswrangler as wr
 # creating log file name
 log_file_name = 'job_' + str(datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')) + '.log'
 extra = {'log_file_name': log_file_name}
@@ -442,6 +440,93 @@ def create_spark_session(config):
     except Exception as e:
         raise Exception("Error in Spark Session Creation.")
 
+# DynamoDB type indicators for extracting values from the type wrapper format
+DYNAMODB_TYPE_INDICATORS = ['S', 'N', 'B', 'BOOL', 'NULL', 'M', 'L', 'SS', 'NS', 'BS']
+
+
+def process_nested_json_spark(spark, base_df):
+    """
+    Process nested JSON structures (products, personalDetails.partyList) using PySpark.
+    :param spark: spark session object
+    :param base_df: base PySpark DataFrame with nested structures
+    :return: flattened PySpark DataFrame
+    """
+    result_df = base_df
+    
+    # Get all column names for later reference
+    all_columns = result_df.columns
+    
+    # Handle 'products' array if it exists
+    if 'products' in all_columns:
+        # Check if products is an array type
+        products_field = next((f for f in result_df.schema.fields if f.name == 'products'), None)
+        if products_field and isinstance(products_field.dataType, ArrayType):
+            # Explode products array
+            products_exploded = result_df.select(
+                col('leadId'),
+                explode_outer(col('products')).alias('product_item')
+            )
+            
+            # Flatten the product struct if it exists
+            if products_exploded.schema['product_item'].dataType and hasattr(products_exploded.schema['product_item'].dataType, 'fields'):
+                product_cols = [col('leadId')]
+                for field in products_exploded.schema['product_item'].dataType.fields:
+                    product_cols.append(col(f'product_item.{field.name}').alias(f'products_{field.name}'))
+                products_flat = products_exploded.select(product_cols)
+            else:
+                products_flat = products_exploded.withColumnRenamed('product_item', 'products_item')
+            
+            # Drop products column from result and join with flattened products
+            result_df = result_df.drop('products')
+            result_df = result_df.join(products_flat, on='leadId', how='outer')
+    
+    # Handle 'personalDetails.partyList' - first check if personalDetails exists
+    if 'personalDetails' in result_df.columns:
+        pd_field = next((f for f in result_df.schema.fields if f.name == 'personalDetails'), None)
+        if pd_field and hasattr(pd_field.dataType, 'fields'):
+            # Check if partyList exists in personalDetails
+            party_list_field = next((f for f in pd_field.dataType.fields if f.name == 'partyList'), None)
+            if party_list_field and isinstance(party_list_field.dataType, ArrayType):
+                # Explode partyList array
+                party_exploded = result_df.select(
+                    col('leadId'),
+                    explode_outer(col('personalDetails.partyList')).alias('party_item')
+                )
+                
+                # Flatten the party struct
+                if party_exploded.schema['party_item'].dataType and hasattr(party_exploded.schema['party_item'].dataType, 'fields'):
+                    party_cols = [col('leadId')]
+                    for field in party_exploded.schema['party_item'].dataType.fields:
+                        party_cols.append(col(f'party_item.{field.name}').alias(f'personalDetails_partyList_{field.name}'))
+                    party_flat = party_exploded.select(party_cols)
+                else:
+                    party_flat = party_exploded.withColumnRenamed('party_item', 'personalDetails_partyList_item')
+                
+                # Flatten other personalDetails fields (excluding partyList)
+                for field in pd_field.dataType.fields:
+                    if field.name != 'partyList':
+                        alias_name = f'personalDetails_{field.name}'
+                        result_df = result_df.withColumn(alias_name, col(f'personalDetails.{field.name}'))
+                
+                # Drop personalDetails and join with flattened party
+                result_df = result_df.drop('personalDetails')
+                result_df = result_df.join(party_flat, on='leadId', how='outer')
+    
+    return result_df
+
+
+def rename_columns_with_dots(df):
+    """
+    Rename columns replacing dots with underscores.
+    :param df: PySpark DataFrame
+    :return: PySpark DataFrame with renamed columns
+    """
+    new_columns = []
+    for c in df.columns:
+        new_columns.append(c.replace('.', '_'))
+    return df.toDF(*new_columns)
+
+
 def read_file(spark, config, file, file_list_to_process):
     """
     This function takes spark session object and json config as input and return initial dataframe created from file
@@ -460,102 +545,125 @@ def read_file(spark, config, file, file_list_to_process):
             input_file_path = file
             logger.info("Reading input file from path : " + input_file_path)
             print("Reading input file from path : " + input_file_path)
-            # reading all the files with provided input format type in source path
-            df = wr.s3.read_parquet(input_file_path)
-            df1 = df.reset_index().drop('index', axis =1)
-            lyst = []
-            lst_dict=[]
-            for i in range(len(df1)):
-                tpp = df1.loc[i].to_json()
-                jsn = json.loads(tpp)
-                lst_dict.append(jsn)
-            Tdf = pd.json_normalize(lst_dict)
-            Tdf.drop(['sequence'], axis=1, inplace=True)
-            tmp = Tdf.to_dict('records')
-            prdct = pd.json_normalize(tmp, ['products'], record_prefix='products.',errors='ignore', meta = ['leadId'])
-            party = pd.json_normalize(tmp, ['personalDetails.partyList'], record_prefix='personalDetails.partyList.',errors='ignore', meta = ['leadId'])
-            prefinal = Tdf.merge(party, on=['leadId'], how='outer').drop('personalDetails.partyList', axis=1)
-            fdf = prefinal.merge(prdct, on=['leadId'], how='outer').drop('products', axis=1)
-            lstt = []
-            for col in fdf.columns:
-                logger.info(col)
-                print(col)
-                if '.' in col:
-                    col = col.replace('.','_')
-                    lstt.append(col)
-                else:
-                    lstt.append(col)
-            fdf.columns=lstt
-            #fdf = fdf.dropna(subset=['leadId'])
-            fnl = fdf.fillna('')
+            # reading all the files with provided input format type in source path using PySpark
+            df = spark.read.parquet(input_file_path)
+            
+            # Drop 'sequence' column if it exists
+            if 'sequence' in df.columns:
+                df = df.drop('sequence')
+            
+            # Process nested JSON structures using PySpark
+            fnl = process_nested_json_spark(spark, df)
+            
+            # Rename columns replacing dots with underscores
+            fnl = rename_columns_with_dots(fnl)
+            
+            # Fill null values with empty string
+            fnl = fnl.na.fill('')
+            
         # read file in case of incremental load
         else:
-            lst_dict = []
-            seq_num = []
             # this part will read list of files which are there in unprocessed folder
             input_file_path = file_list_to_process
-            #logger.info("Reading input file from path : " + str(input_file_path))
             logger.info("Reading input file from paths")
             print("Reading input file from paths")
-            # reading list of files present in unprocessed folder
-            for file in input_file_path:
-                df = wr.s3.read_json(file, use_threads=True)
-                lyst = df['Records'].tolist()
-                #lst_dict = []
-                #seq_num = []
-                for i in range(len(lyst)):
-                    newimage = lyst[i]['dynamodb']['NewImage']
-                    jsn = from_dynamodb_to_json(newimage)
-                    lst_dict.append(jsn)
-                    seq_no = lyst[i]['dynamodb']['SequenceNumber']
-                    seq_num.append(seq_no)
+            
+            # Read all JSON files using PySpark
+            json_df = spark.read.json(input_file_path)
+            
+            # Explode the Records array to process each record
+            records_df = json_df.select(explode_outer(col('Records')).alias('record'))
+            
+            # Extract NewImage and SequenceNumber from each record
+            records_with_seq = records_df.select(
+                col('record.dynamodb.NewImage').alias('NewImage'),
+                col('record.dynamodb.SequenceNumber').alias('Sequence_No')
+            )
+            
+            # Flatten the NewImage struct - this contains the DynamoDB JSON format
+            # We need to extract the actual values from the DynamoDB type wrappers (S, N, etc.)
+            if 'NewImage' in records_with_seq.columns:
+                new_image_field = next((f for f in records_with_seq.schema.fields if f.name == 'NewImage'), None)
+                if new_image_field and hasattr(new_image_field.dataType, 'fields'):
+                    select_cols = [col('Sequence_No')]
+                    for field in new_image_field.dataType.fields:
+                        # DynamoDB stores values as {"S": "value"} or {"N": "123"}, etc.
+                        # Try to extract the actual value
+                        if hasattr(field.dataType, 'fields'):
+                            # Check for common DynamoDB types
+                            for subfield in field.dataType.fields:
+                                if subfield.name in DYNAMODB_TYPE_INDICATORS:
+                                    select_cols.append(col(f'NewImage.{field.name}.{subfield.name}').alias(field.name))
+                                    break
+                            else:
+                                # If no DynamoDB type wrapper found, just use the struct
+                                select_cols.append(col(f'NewImage.{field.name}').alias(field.name))
+                        else:
+                            select_cols.append(col(f'NewImage.{field.name}').alias(field.name))
+                    
+                    base_df = records_with_seq.select(select_cols)
+                else:
+                    base_df = records_with_seq
+            else:
+                base_df = records_with_seq
+            
             logger.info("Out of the Loop")
             print("Out of the Loop")
-            Tdf = pd.json_normalize(lst_dict)
-            if 'sequence' in Tdf.columns:
-                Tdf.drop(['sequence'], axis=1, inplace=True)
-            Tdf['Sequence_No'] = seq_num
+            
+            # Drop 'sequence' column if it exists
+            if 'sequence' in base_df.columns:
+                base_df = base_df.drop('sequence')
+            
             logger.info("Tdf is created")
             print("Tdf is created")
-            tmp = Tdf.to_dict('records')
-            prdct = pd.json_normalize(tmp, ['products'], record_prefix='products.',errors='ignore', meta = ['leadId'])
-            party = pd.json_normalize(tmp, ['personalDetails.partyList'], record_prefix='personalDetails.partyList.',errors='ignore', meta = ['leadId'])
-            prefinal = Tdf.merge(party, on=['leadId'], how='outer').drop('personalDetails.partyList', axis=1)
-            fnl = prefinal.merge(prdct, on=['leadId'], how='outer').drop('products', axis=1)
-            fnl = fnl.fillna('')
-            lsti = []
+            
+            # Process nested JSON structures (products, personalDetails.partyList)
+            fnl = process_nested_json_spark(spark, base_df)
+            
             logger.info("final df is created")
             print("final df is created")
-            for col in fnl.columns:
-                if '.' in col:
-                    col = col.replace('.','_')
-                    lsti.append(col)
-                else:
-                    lsti.append(col)
-            fnl.columns = lsti
+            
+            # Fill null values with empty string
+            fnl = fnl.na.fill('')
+            
+            # Rename columns replacing dots with underscores
+            fnl = rename_columns_with_dots(fnl)
+            
             logger.info("Columns renaming is done")
             print("Columns renaming is done")
+        
         return fnl
     except Exception as e:
         raise Exception("Error reading input file.")
 
-def column_chck (config, spark, initial_df):
-    output_file_path = config['destination_path'] + '/' + config['table_name'] + '/'+ '*.parquet'
+def column_chck(config, spark, initial_df):
+    """
+    Check for missing columns in the raw data compared to the destination schema.
+    :param config: config dictionary
+    :param spark: spark session object
+    :param initial_df: PySpark DataFrame to check and update
+    :return: PySpark DataFrame with missing columns added
+    """
+    output_file_path = config['destination_path'] + '/' + config['table_name'] + '/'
     logger.info('path to read for checking missing columns in raw data : ' + output_file_path)
     print('path to read for checking missing columns in raw data : ' + output_file_path)
-    chk_df = wr.s3.read_parquet(output_file_path, chunked=True)
-    chck = []
-    for df in chk_df:
-        col = df.columns.to_list()[5:]
-        for cl in col:
-            if cl not in chck:
-                chck.append(cl)
-            else:
-                pass
-    cols = initial_df.columns.to_list()
-    miss = list(set(chck)-set(cols))
+    
+    # Read parquet files using PySpark
+    chk_df = spark.read.parquet(output_file_path)
+    
+    # Get all column names from the destination schema (skip first 5 columns)
+    chck = chk_df.columns[5:]
+    
+    # Get columns from initial_df
+    cols = initial_df.columns
+    
+    # Find missing columns
+    miss = list(set(chck) - set(cols))
+    
+    # Add missing columns with empty string values using PySpark
     for cl in miss:
-        initial_df[cl] = ''
+        initial_df = initial_df.withColumn(cl, lit(""))
+    
     #logger.info('columns appended are:' + str(miss))
     #print('columns appended are:' + str(miss))
     return initial_df
@@ -632,7 +740,8 @@ def main():
                 files_read = full_fileread(config)
                 for file in files_read:
                     initial_df = read_file(spark, config, file, file_list_to_process)
-                    initial_df = spark.createDataFrame(initial_df.astype(str))
+                    # Cast all columns to string type
+                    initial_df = initial_df.select([col(c).cast(StringType()).alias(c) for c in initial_df.columns])
                     initial_df = initial_df.withColumn('Sequence_No', F.lit(datetime.datetime.now().strftime("%Y%m%d%H%M%S")))
                     # get insert, update and delete record count
                     # record_count_dict_updated = get_record_count(spark, initial_df, config)
@@ -646,7 +755,8 @@ def main():
                     file_list = file_list_to_process[i:i+10000]
                     initial_df = read_file(spark, config, file, file_list)
                     initial_df = column_chck(config, spark, initial_df)
-                    initial_df = spark.createDataFrame(initial_df.astype(str))
+                    # Cast all columns to string type
+                    initial_df = initial_df.select([col(c).cast(StringType()).alias(c) for c in initial_df.columns])
                     # get insert, update and delete record count
                     # record_count_dict_updated = get_record_count(spark, initial_df, config)
                     # writing input file dataframe
