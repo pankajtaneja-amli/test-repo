@@ -155,6 +155,10 @@ class DynamoDBJsonHandler:
         return [col.replace('.', '_') for col in columns]
 
 
+# Module-level singleton instance for the DynamoDB handler
+_dynamodb_handler = DynamoDBJsonHandler()
+
+
 # Legacy function wrapper for backward compatibility
 def from_dynamodb_to_json(item: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -168,8 +172,7 @@ def from_dynamodb_to_json(item: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Standard Python dictionary with deserialized values
     """
-    handler = DynamoDBJsonHandler()
-    return handler.deserialize_item(item)
+    return _dynamodb_handler.deserialize_item(item)
 
 
 def flatten_nested_json(data: Any, prefix: str = '') -> List[Tuple[str, Any]]:
@@ -183,8 +186,7 @@ def flatten_nested_json(data: Any, prefix: str = '') -> List[Tuple[str, Any]]:
     Returns:
         List of (key, value) tuples
     """
-    handler = DynamoDBJsonHandler()
-    return handler.flatten_nested_structure(data, prefix)
+    return _dynamodb_handler.flatten_nested_structure(data, prefix)
 
 
 # =============================================================================
@@ -936,8 +938,21 @@ def get_full_load_file_list(config: Dict[str, Any]) -> List[str]:
 # Main Entry Point
 # =============================================================================
 
-# Batch size for incremental processing
-INCREMENTAL_BATCH_SIZE = 10000
+# Default batch size for incremental processing (can be overridden via config)
+DEFAULT_INCREMENTAL_BATCH_SIZE = 10000
+
+
+def get_batch_size(config: Dict[str, Any]) -> int:
+    """
+    Get the batch size for incremental processing from config or use default.
+
+    Args:
+        config: Configuration dictionary
+
+    Returns:
+        Batch size as integer
+    """
+    return int(config.get('incremental_batch_size', DEFAULT_INCREMENTAL_BATCH_SIZE))
 
 
 def main() -> None:
@@ -1068,8 +1083,10 @@ def _process_incremental_load_files(
         file_list_to_process: List of raw files to process
         unprocessed_list: List of bookmark files to move after processing
     """
-    for i in range(0, len(file_list_to_process), INCREMENTAL_BATCH_SIZE):
-        file_batch = file_list_to_process[i:i + INCREMENTAL_BATCH_SIZE]
+    batch_size = get_batch_size(config)
+
+    for i in range(0, len(file_list_to_process), batch_size):
+        file_batch = file_list_to_process[i:i + batch_size]
 
         initial_df = read_file(spark, config, None, file_batch)
         initial_df = check_and_add_missing_columns(config, spark, initial_df)
@@ -1079,7 +1096,7 @@ def _process_incremental_load_files(
         print("Writing output dataframe")
         write_file(spark_df, config, '')
 
-        bookmark_batch = unprocessed_list[i:i + INCREMENTAL_BATCH_SIZE]
+        bookmark_batch = unprocessed_list[i:i + batch_size]
         move_unprocessed_to_processed(config, bookmark_batch)
 
 
