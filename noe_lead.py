@@ -5,7 +5,8 @@ from pyspark.sql import SparkSession
 from pyspark import SparkConf
 from pyspark.sql import functions as F
 from pyspark.sql.functions import col, concat_ws, when, collect_list, lit, to_timestamp
-from pyspark.sql.functions import year, month, date_format
+from pyspark.sql.functions import year, month, date_format, explode_outer
+from pyspark.sql.types import StringType, ArrayType, StructType
 import sys
 import logging
 import datetime
@@ -14,7 +15,6 @@ import time
 sys.path.append('/home/hadoop')
 import boto3
 from boto3.dynamodb.types import TypeDeserializer
-from pyspark.sql.types import StringType
 # creating log file name
 log_file_name = 'job_' + str(datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')) + '.log'
 extra = {'log_file_name': log_file_name}
@@ -451,8 +451,7 @@ def flatten_struct_columns(df, prefix=""):
     for field in df.schema.fields:
         col_name = f"{prefix}{field.name}" if prefix else field.name
         if hasattr(field.dataType, 'fields'):
-            # It's a struct, recurse
-            nested_df = df.select(f"`{field.name}`.*") if not prefix else df
+            # It's a struct, recurse through nested fields
             for nested_field in field.dataType.fields:
                 nested_col_name = f"{col_name}_{nested_field.name}"
                 if hasattr(nested_field.dataType, 'fields'):
@@ -472,9 +471,6 @@ def process_nested_json_spark(spark, base_df):
     :param base_df: base PySpark DataFrame with nested structures
     :return: flattened PySpark DataFrame
     """
-    from pyspark.sql.functions import explode_outer, col as spark_col
-    from pyspark.sql.types import ArrayType, StructType
-    
     result_df = base_df
     
     # Get all column names for later reference
@@ -487,15 +483,15 @@ def process_nested_json_spark(spark, base_df):
         if products_field and isinstance(products_field.dataType, ArrayType):
             # Explode products array
             products_exploded = result_df.select(
-                spark_col('leadId'),
-                explode_outer(spark_col('products')).alias('product_item')
+                col('leadId'),
+                explode_outer(col('products')).alias('product_item')
             )
             
             # Flatten the product struct if it exists
             if products_exploded.schema['product_item'].dataType and hasattr(products_exploded.schema['product_item'].dataType, 'fields'):
-                product_cols = [spark_col('leadId')]
+                product_cols = [col('leadId')]
                 for field in products_exploded.schema['product_item'].dataType.fields:
-                    product_cols.append(spark_col(f'product_item.{field.name}').alias(f'products_{field.name}'))
+                    product_cols.append(col(f'product_item.{field.name}').alias(f'products_{field.name}'))
                 products_flat = products_exploded.select(product_cols)
             else:
                 products_flat = products_exploded.withColumnRenamed('product_item', 'products_item')
@@ -513,29 +509,24 @@ def process_nested_json_spark(spark, base_df):
             if party_list_field and isinstance(party_list_field.dataType, ArrayType):
                 # Explode partyList array
                 party_exploded = result_df.select(
-                    spark_col('leadId'),
-                    explode_outer(spark_col('personalDetails.partyList')).alias('party_item')
+                    col('leadId'),
+                    explode_outer(col('personalDetails.partyList')).alias('party_item')
                 )
                 
                 # Flatten the party struct
                 if party_exploded.schema['party_item'].dataType and hasattr(party_exploded.schema['party_item'].dataType, 'fields'):
-                    party_cols = [spark_col('leadId')]
+                    party_cols = [col('leadId')]
                     for field in party_exploded.schema['party_item'].dataType.fields:
-                        party_cols.append(spark_col(f'party_item.{field.name}').alias(f'personalDetails_partyList_{field.name}'))
+                        party_cols.append(col(f'party_item.{field.name}').alias(f'personalDetails_partyList_{field.name}'))
                     party_flat = party_exploded.select(party_cols)
                 else:
                     party_flat = party_exploded.withColumnRenamed('party_item', 'personalDetails_partyList_item')
                 
                 # Flatten other personalDetails fields (excluding partyList)
-                other_pd_cols = []
                 for field in pd_field.dataType.fields:
                     if field.name != 'partyList':
-                        other_pd_cols.append(spark_col(f'personalDetails.{field.name}').alias(f'personalDetails_{field.name}'))
-                
-                if other_pd_cols:
-                    # Add other personalDetails columns to result
-                    for c in other_pd_cols:
-                        result_df = result_df.withColumn(c._jc.toString().split(' AS ')[1], spark_col(f'personalDetails.{c._jc.toString().split(" AS ")[0].split(".")[-1]}'))
+                        alias_name = f'personalDetails_{field.name}'
+                        result_df = result_df.withColumn(alias_name, col(f'personalDetails.{field.name}'))
                 
                 # Drop personalDetails and join with flattened party
                 result_df = result_df.drop('personalDetails')
@@ -601,14 +592,12 @@ def read_file(spark, config, file, file_list_to_process):
             json_df = spark.read.json(input_file_path)
             
             # Explode the Records array to process each record
-            from pyspark.sql.functions import explode_outer, col as spark_col, monotonically_increasing_id
-            
-            records_df = json_df.select(explode_outer(spark_col('Records')).alias('record'))
+            records_df = json_df.select(explode_outer(col('Records')).alias('record'))
             
             # Extract NewImage and SequenceNumber from each record
             records_with_seq = records_df.select(
-                spark_col('record.dynamodb.NewImage').alias('NewImage'),
-                spark_col('record.dynamodb.SequenceNumber').alias('Sequence_No')
+                col('record.dynamodb.NewImage').alias('NewImage'),
+                col('record.dynamodb.SequenceNumber').alias('Sequence_No')
             )
             
             # Flatten the NewImage struct - this contains the DynamoDB JSON format
@@ -616,7 +605,7 @@ def read_file(spark, config, file, file_list_to_process):
             if 'NewImage' in records_with_seq.columns:
                 new_image_field = next((f for f in records_with_seq.schema.fields if f.name == 'NewImage'), None)
                 if new_image_field and hasattr(new_image_field.dataType, 'fields'):
-                    select_cols = [spark_col('Sequence_No')]
+                    select_cols = [col('Sequence_No')]
                     for field in new_image_field.dataType.fields:
                         # DynamoDB stores values as {"S": "value"} or {"N": "123"}, etc.
                         # Try to extract the actual value
@@ -624,13 +613,13 @@ def read_file(spark, config, file, file_list_to_process):
                             # Check for common DynamoDB types
                             for subfield in field.dataType.fields:
                                 if subfield.name in ['S', 'N', 'B', 'BOOL', 'NULL', 'M', 'L', 'SS', 'NS', 'BS']:
-                                    select_cols.append(spark_col(f'NewImage.{field.name}.{subfield.name}').alias(field.name))
+                                    select_cols.append(col(f'NewImage.{field.name}.{subfield.name}').alias(field.name))
                                     break
                             else:
                                 # If no DynamoDB type wrapper found, just use the struct
-                                select_cols.append(spark_col(f'NewImage.{field.name}').alias(field.name))
+                                select_cols.append(col(f'NewImage.{field.name}').alias(field.name))
                         else:
-                            select_cols.append(spark_col(f'NewImage.{field.name}').alias(field.name))
+                            select_cols.append(col(f'NewImage.{field.name}').alias(field.name))
                     
                     base_df = records_with_seq.select(select_cols)
                 else:
