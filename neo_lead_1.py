@@ -751,7 +751,11 @@ def full_fileread(config):
     logger.info(f"Bucket: {bucket_name}")
     print(f"Bucket: {bucket_name}")
     
-    prefix = 'data/NeoProposal/Neorewiring-prod-lead/full20231101/'
+    # Use prefix from config source_path, or fallback to default for compatibility
+    if len(config['source_path'].split('/')) > 3:
+        prefix = '/'.join(config['source_path'].split('/')[3:]) + '/'
+    else:
+        prefix = 'data/NeoProposal/Neorewiring-prod-lead/full20231101/'
     logger.info(f"Prefix: {prefix}")
     print(f"Prefix: {prefix}")
     
@@ -848,7 +852,7 @@ def main():
                     logger.info(f"Processing batch {batch_num + 1}/{total_batches} with {len(file_list)} files")
                     print(f"Processing batch {batch_num + 1}/{total_batches}")
                     
-                    initial_df = read_file(spark, config, file, file_list)
+                    initial_df = read_file(spark, config, None, file_list)
                     
                     if len(initial_df) == 0:
                         logger.warning(f"No data in batch {batch_num + 1}, skipping")
