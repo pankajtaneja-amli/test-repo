@@ -1,0 +1,130 @@
+{
+  "Comment": "Qlik Replication Task Monitoring Workflow",
+  "StartAt": "MonitorTasks",
+  "States": {
+    "MonitorTasks": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:QlikMonitor-MonitorTasks",
+      "Comment": "Monitor all Qlik replication tasks and detect anomalies",
+      "ResultPath": "$.monitoringResults",
+      "Next": "CheckAnomalies",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "MonitoringFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "CheckAnomalies": {
+      "Type": "Choice",
+      "Comment": "Check if any anomalies were detected",
+      "Choices": [
+        {
+          "Variable": "$.monitoringResults.body",
+          "StringMatches": "*proposals*",
+          "Next": "ProcessProposals"
+        }
+      ],
+      "Default": "NoActionNeeded"
+    },
+    "ProcessProposals": {
+      "Type": "Map",
+      "Comment": "Process each restart proposal",
+      "ItemsPath": "$.monitoringResults.proposals",
+      "Iterator": {
+        "StartAt": "EvaluateProposal",
+        "States": {
+          "EvaluateProposal": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:QlikMonitor-EvaluateProposal",
+            "Comment": "Evaluate if restart should be executed",
+            "ResultPath": "$.evaluation",
+            "Next": "CheckApproval"
+          },
+          "CheckApproval": {
+            "Type": "Choice",
+            "Comment": "Check if approval is required",
+            "Choices": [
+              {
+                "Variable": "$.evaluation.requires_approval",
+                "BooleanEquals": true,
+                "Next": "WaitForApproval"
+              }
+            ],
+            "Default": "ExecuteRestart"
+          },
+          "WaitForApproval": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:sfn:sendTaskSuccess",
+            "Comment": "Wait for human approval via callback",
+            "Parameters": {
+              "TaskToken.$": "$$.Task.Token",
+              "Output": {
+                "approved": true
+              }
+            },
+            "ResultPath": "$.approval",
+            "Next": "ExecuteRestart",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "ApprovalDenied"
+              }
+            ]
+          },
+          "ExecuteRestart": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:QlikMonitor-ExecuteRestart",
+            "Comment": "Execute the task restart",
+            "ResultPath": "$.restartResult",
+            "Next": "RestartSuccess"
+          },
+          "RestartSuccess": {
+            "Type": "Succeed",
+            "Comment": "Restart executed successfully"
+          },
+          "ApprovalDenied": {
+            "Type": "Succeed",
+            "Comment": "Restart approval denied by user"
+          }
+        }
+      },
+      "ResultPath": "$.proposalResults",
+      "Next": "GenerateReport"
+    },
+    "GenerateReport": {
+      "Type": "Pass",
+      "Comment": "Generate final monitoring report",
+      "Parameters": {
+        "reportTime.$": "$$.State.EnteredTime",
+        "tasksChecked.$": "$.monitoringResults.tasks_checked",
+        "anomaliesFound.$": "$.monitoringResults.anomalies_count",
+        "proposalsProcessed.$": "States.ArrayLength($.proposalResults)",
+        "healthState.$": "$.monitoringResults.health_state"
+      },
+      "ResultPath": "$.finalReport",
+      "Next": "Success"
+    },
+    "NoActionNeeded": {
+      "Type": "Pass",
+      "Comment": "All tasks are healthy, no action required",
+      "Result": {
+        "status": "healthy",
+        "message": "No anomalies detected"
+      },
+      "ResultPath": "$.finalReport",
+      "Next": "Success"
+    },
+    "MonitoringFailed": {
+      "Type": "Fail",
+      "Comment": "Monitoring cycle failed",
+      "Cause": "Failed to monitor tasks",
+      "Error": "MonitoringError"
+    },
+    "Success": {
+      "Type": "Succeed",
+      "Comment": "Monitoring workflow completed successfully"
+    }
+  }
+}
